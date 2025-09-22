@@ -1,7 +1,0 @@
-
-go build -o ./swear-killer
-
-./.swear-killer \
-  --srt "/Users/alex/Downloads/nobody.2/nobody.2.srt" \
-  --video "/Users/alex/Downloads/nobody.2/nobody.2.mkv" \
-  --output "/Users/alex/Downloads/nobody.2/nobody.2-clean.mp4"

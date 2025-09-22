@@ -26,6 +26,13 @@ type Segment struct {
 	End   float64 // End time in seconds
 }
 
+// SubtitleStream represents an embedded subtitle stream
+type SubtitleStream struct {
+	Index    int
+	Language string
+	Title    string
+}
+
 // SwearKillerApp holds the GUI state
 type SwearKillerApp struct {
 	srtPath    string
@@ -35,7 +42,9 @@ type SwearKillerApp struct {
 	swears     []string
 
 	srtLabel        *widget.Label
+	srtButton       *widget.Button
 	videoLabel      *widget.Label
+	videoButton     *widget.Button
 	outputLabel     *widget.Label
 	offsetEntry     *widget.Entry
 	logText         *widget.Entry
@@ -181,6 +190,169 @@ func mergeSegments(segments []Segment) []Segment {
 	return merged
 }
 
+// detectEmbeddedSubtitles uses ffprobe to find embedded subtitle streams with detailed info
+func detectEmbeddedSubtitles(videoPath string) ([]SubtitleStream, error) {
+	// Get subtitle stream info in JSON format
+	cmd := exec.Command("ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", "-select_streams", "s", videoPath)
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	// Use proper JSON parsing instead of line-by-line parsing
+	var jsonData struct {
+		Streams []struct {
+			Index     int    `json:"index"`
+			CodecType string `json:"codec_type"`
+			Tags      struct {
+				Language string `json:"language"`
+				Title    string `json:"title"`
+			} `json:"tags"`
+		} `json:"streams"`
+	}
+
+	err = json.Unmarshal(output, &jsonData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse JSON: %v", err)
+	}
+
+	var streams []SubtitleStream
+	subtitleStreamCount := 0
+
+	for _, stream := range jsonData.Streams {
+		if stream.CodecType == "subtitle" {
+			// Determine display title
+			displayTitle := stream.Tags.Title
+			if displayTitle == "" {
+				displayTitle = formatLanguageDisplay(stream.Tags.Language)
+				if displayTitle == "Unknown" || displayTitle == "" {
+					displayTitle = fmt.Sprintf("Track %d", subtitleStreamCount+1)
+				}
+			}
+
+			languageDisplay := formatLanguageDisplay(stream.Tags.Language)
+
+			finalStream := SubtitleStream{
+				Index:    subtitleStreamCount,
+				Language: stream.Tags.Language,
+				Title:    fmt.Sprintf("%s - [%s]", displayTitle, languageDisplay),
+			}
+
+			streams = append(streams, finalStream)
+			subtitleStreamCount++
+		}
+	}
+
+	return streams, nil
+}
+
+// formatSubtitleTitle creates VLC-style subtitle titles
+func formatSubtitleTitle(stream *SubtitleStream, trackNum int) string {
+	if stream.Title != "" && !isSubtitleCodec(stream.Title) {
+		return stream.Title
+	}
+
+	// Generate a title like VLC does
+	if stream.Language != "" {
+		switch strings.ToLower(stream.Language) {
+		case "eng", "en":
+			if strings.Contains(strings.ToLower(stream.Title), "sdh") {
+				return "SDH"
+			}
+			return "English"
+		case "spa", "es":
+			return "Spanish"
+		case "fre", "fr", "fra":
+			return "French"
+		case "ger", "de", "deu":
+			return "German"
+		default:
+			return fmt.Sprintf("Track %d", trackNum+1)
+		}
+	}
+
+	return fmt.Sprintf("Track %d", trackNum+1)
+}
+
+// formatLanguageDisplay formats language codes like VLC
+func formatLanguageDisplay(lang string) string {
+	if lang == "" {
+		return "Unknown"
+	}
+
+	switch strings.ToLower(lang) {
+	case "eng", "en":
+		return "English"
+	case "spa", "es":
+		return "Spanish"
+	case "fre", "fr", "fra":
+		return "French"
+	case "ger", "de", "deu":
+		return "German"
+	case "ita", "it":
+		return "Italian"
+	case "por", "pt":
+		return "Portuguese"
+	case "jpn", "ja":
+		return "Japanese"
+	case "kor", "ko":
+		return "Korean"
+	case "chi", "zh", "zho":
+		return "Chinese"
+	case "rus", "ru":
+		return "Russian"
+	case "ara", "ar":
+		return "Arabic"
+	case "hin", "hi":
+		return "Hindi"
+	default:
+		return strings.ToUpper(lang)
+	}
+}
+
+// extractJSONValue extracts a value from a JSON line like "key": "value"
+func extractJSONValue(line, key string) string {
+	// Look for "key": "value" pattern
+	pattern := fmt.Sprintf(`"%s":\s*"([^"]*)"`, key)
+	re := regexp.MustCompile(pattern)
+	matches := re.FindStringSubmatch(line)
+	if len(matches) > 1 {
+		return matches[1]
+	}
+	return ""
+}
+
+// isSubtitleCodec checks if a codec is a subtitle codec
+func isSubtitleCodec(codec string) bool {
+	if codec == "" {
+		return false
+	}
+
+	// If it's just marked as "subtitle", accept it
+	if strings.ToLower(codec) == "subtitle" {
+		return true
+	}
+
+	subtitleCodecs := []string{
+		"subrip", "srt", "ass", "ssa", "webvtt", "mov_text",
+		"dvd_subtitle", "hdmv_pgs_subtitle", "dvb_subtitle",
+		"text", "pgs", "vobsub", "subtitle",
+	}
+
+	for _, subCodec := range subtitleCodecs {
+		if strings.Contains(strings.ToLower(codec), subCodec) {
+			return true
+		}
+	}
+	return false
+}
+
+// extractEmbeddedSubtitle extracts a specific subtitle stream to an SRT file
+func extractEmbeddedSubtitle(videoPath string, streamIndex int, outputPath string) error {
+	cmd := exec.Command("ffmpeg", "-i", videoPath, "-map", fmt.Sprintf("0:s:%d", streamIndex), "-c:s", "srt", "-y", outputPath)
+	return cmd.Run()
+}
+
 // generateFFmpegCommand creates an FFmpeg command to mute audio for the given segments
 func generateFFmpegCommand(inputVideo, outputVideo string, segments []Segment) string {
 	if len(segments) == 0 {
@@ -196,6 +368,108 @@ func generateFFmpegCommand(inputVideo, outputVideo string, segments []Segment) s
 	filter := fmt.Sprintf("volume=enable='%s':volume=0", enableExpr)
 
 	return fmt.Sprintf("ffmpeg -i %q -af %q -c:v copy -c:a aac %q", inputVideo, filter, outputVideo)
+}
+
+// handleVideoSelection processes video file selection and checks for embedded subtitles
+func (app *SwearKillerApp) handleVideoSelection(videoPath string) {
+	app.videoPath = videoPath
+	app.videoLabel.SetText(fmt.Sprintf("Selected: %s", filepath.Base(videoPath)))
+
+	// Check for embedded subtitles
+	app.log("Checking for embedded subtitles...")
+	streams, err := detectEmbeddedSubtitles(videoPath)
+	if err != nil {
+		app.log(fmt.Sprintf("Error checking for subtitles: %v", err))
+		app.showSRTUploadOption()
+		return
+	}
+
+	if len(streams) == 0 {
+		app.log("No embedded subtitles found. Please upload an SRT file.")
+		app.showSRTUploadOption()
+		return
+	}
+
+	app.log(fmt.Sprintf("Found %d embedded subtitle stream(s):", len(streams)))
+	for i, stream := range streams {
+		app.log(fmt.Sprintf("  Track %d: %s", i+1, stream.Title))
+	}
+	app.showSubtitleSelectionDialog(streams)
+}
+
+// showSRTUploadOption shows the SRT upload button
+func (app *SwearKillerApp) showSRTUploadOption() {
+	app.srtButton.Show()
+	app.srtLabel.Show()
+}
+
+// showSubtitleSelectionDialog shows a dialog to select subtitle source
+func (app *SwearKillerApp) showSubtitleSelectionDialog(streams []SubtitleStream) {
+	var options []string
+
+	// Add embedded subtitle options with VLC-style formatting
+	for i, stream := range streams {
+		options = append(options, stream.Title)
+		_ = i // Keep for mapping back to stream index
+	}
+
+	// Add manual upload option
+	options = append(options, "📁 Upload SRT file manually")
+
+	// Create selection dialog
+	selectWidget := widget.NewSelect(options, func(selected string) {
+		// Auto-close the dialog when selection is made
+		// We'll handle this in the callback
+	})
+
+	content := container.NewVBox(
+		widget.NewLabel("Choose subtitle source:"),
+		selectWidget,
+	)
+
+	dialog := dialog.NewCustom("Subtitle Selection", "Cancel", content, app.myWindow)
+
+	// Override the select callback to auto-close dialog
+	selectWidget.OnChanged = func(selected string) {
+		dialog.Hide() // Close dialog immediately
+
+		if selected == "📁 Upload SRT file manually" {
+			app.showSRTUploadOption()
+			return
+		}
+
+		// Find selected stream index
+		for i, option := range options[:len(streams)] {
+			if option == selected {
+				app.extractAndUseEmbeddedSubtitle(streams[i])
+				break
+			}
+		}
+	}
+
+	dialog.Show()
+}
+
+// extractAndUseEmbeddedSubtitle extracts and uses an embedded subtitle
+func (app *SwearKillerApp) extractAndUseEmbeddedSubtitle(stream SubtitleStream) {
+	videoDir := filepath.Dir(app.videoPath)
+	srtPath := filepath.Join(videoDir, "extracted-srt.srt")
+
+	app.log(fmt.Sprintf("🎬 Selected: %s", stream.Title))
+	app.log(fmt.Sprintf("⚙️ Extracting subtitle track %d to %s...", stream.Index, srtPath))
+
+	err := extractEmbeddedSubtitle(app.videoPath, stream.Index, srtPath)
+	if err != nil {
+		app.log(fmt.Sprintf("❌ Error extracting subtitle: %v", err))
+		app.log("💡 Tip: Try using 'Upload SRT file manually' option")
+		app.showSRTUploadOption()
+		return
+	}
+
+	app.srtPath = srtPath
+	app.srtLabel.SetText(fmt.Sprintf("Using extracted: %s (%s)", stream.Language, filepath.Base(srtPath)))
+	app.log("✅ Subtitle extracted successfully!")
+	app.updateProcessButton()
 }
 
 // log adds a message to the log text area
@@ -439,12 +713,7 @@ func (app *SwearKillerApp) executeFFmpeg() {
 				for scanner.Scan() {
 					line := scanner.Text()
 
-					// Only log relevant progress lines to keep output clean
-					if strings.Contains(line, "time=") || strings.Contains(line, "out_time_us=") || strings.Contains(line, "progress=") {
-						fyne.Do(func() {
-							app.log(fmt.Sprintf("FFmpeg: %s", line))
-						})
-					}
+					// Don't log progress lines to keep output clean
 
 					currentTime, found := parseFFmpegProgress(line)
 					if found {
@@ -464,12 +733,7 @@ func (app *SwearKillerApp) executeFFmpeg() {
 							remainingTime = 0
 						}
 
-						// Log progress occasionally to show it's working
-						if int(currentTime)%30 == 0 || percentage >= 99 {
-							fyne.Do(func() {
-								app.log(fmt.Sprintf("⏳ Progress: %.1f%% complete", percentage))
-							})
-						}
+						// Progress is shown in progress bar only, no logging needed
 
 						// Update UI elements on the main thread
 						fyne.Do(func() {
@@ -696,9 +960,9 @@ func main() {
 	// Create UI elements
 	title := widget.NewLabelWithStyle("Swear Killer", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
 
-	// SRT file selection
-	swearApp.srtLabel = widget.NewLabel("No SRT file selected")
-	srtButton := widget.NewButton("Select SRT File", func() {
+	// SRT file selection (initially hidden)
+	swearApp.srtLabel = widget.NewLabel("Subtitle source will be determined after video selection")
+	swearApp.srtButton = widget.NewButton("Select SRT File", func() {
 		dialog.ShowFileOpen(func(reader fyne.URIReadCloser, err error) {
 			if err != nil || reader == nil {
 				return
@@ -709,18 +973,17 @@ func main() {
 			swearApp.updateProcessButton()
 		}, myWindow)
 	})
+	swearApp.srtButton.Hide() // Initially hidden
 
 	// Video file selection
 	swearApp.videoLabel = widget.NewLabel("No video file selected")
-	videoButton := widget.NewButton("Select Video File", func() {
+	swearApp.videoButton = widget.NewButton("Select Video File", func() {
 		dialog.ShowFileOpen(func(reader fyne.URIReadCloser, err error) {
 			if err != nil || reader == nil {
 				return
 			}
 			defer reader.Close()
-			swearApp.videoPath = reader.URI().Path()
-			swearApp.videoLabel.SetText(fmt.Sprintf("Video: %s", reader.URI().Name()))
-			swearApp.updateProcessButton()
+			swearApp.handleVideoSelection(reader.URI().Path())
 		}, myWindow)
 	})
 
@@ -807,8 +1070,8 @@ func main() {
 
 	// Layout
 	fileSection := container.NewVBox(
-		srtButton, swearApp.srtLabel,
-		videoButton, swearApp.videoLabel,
+		swearApp.videoButton, swearApp.videoLabel,
+		swearApp.srtButton, swearApp.srtLabel,
 		swearApp.autoOutput,
 		outputButton, swearApp.outputLabel,
 	)
