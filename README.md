@@ -1,5 +1,7 @@
 # Swear Killer
 
+![Swear Killer Screenshot](screenshot.jpg)
+
 A GUI application for automatically removing profanity from video files by muting audio during detected swear words. The app analyzes subtitle files (SRT) to identify timestamps containing profanity and generates FFmpeg commands to selectively mute those segments.
 
 ## Features
